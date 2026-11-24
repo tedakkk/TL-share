@@ -54,6 +54,139 @@ ORDER BY pg_total_relation_size(relid) DESC;
 
 保留期需滿足審計、補數、低頻 DAG、跨 DAG 依賴等要求；不能機械套用。`log` metadata table 與 task log files 是不同的維護對象。
 
+
+### 3.1 Access PostgreSQL：重用 Airflow 現有連接配置
+
+若 Airflow 2.2.4 已正常運行，可在相同 Python environment、相同服務配置及獲授權的網絡環境中直接連接 metadata DB，通常無需 PostgreSQL server 的 SSH 權限。首先只執行只讀診斷，不執行 DELETE、VACUUM 或 schema migration。
+
+#### 確認配置及連接
+
+Airflow 2.2.4 的連接配置為 `airflow.cfg` 的 `[core]` section 下的 `sql_alchemy_conn`；環境變量 `AIRFLOW__CORE__SQL_ALCHEMY_CONN` 可覆蓋配置。Airflow 2.3 起移至 `[database]`。
+
+```bash
+airflow version
+airflow db check
+# 以下指令可能顯示明文密碼；只在安全終端按需要執行。
+# airflow config get-value core sql_alchemy_conn
+```
+
+不要打印、分享或提交完整 connection URI、密碼、內部 hostname、Fernet key 或真實診斷結果至公開 repository。若在另一個 shell/session 執行，確認使用相同 virtualenv、AIRFLOW_HOME、AIRFLOW_CONFIG、secret 配置及網絡權限。
+
+| 方式 | 前提 | 用途 |
+|---|---|---|
+| Python + Airflow SQLAlchemy engine（首選） | 可使用現有 Airflow environment | 自動化診斷，無需額外輸入 credentials |
+| psql | 已安裝 PostgreSQL client 且網絡可達 | 互動式 SQL |
+| DBeaver | 獲授權的工作站能連接 DB | GUI 瀏覽及管理 |
+
+#### 方法 A：Python（推薦）
+
+直接重用 `airflow.settings.engine`，不需解析或輸出連接字串。以下腳本不依賴 pandas，並使用 read-only transaction 及 statement timeout，避免誤寫或長時間查詢。
+
+```python
+from airflow import settings
+from sqlalchemy import text
+
+queries = {
+    "Connection": """
+        SELECT current_database() AS database_name,
+               current_user AS db_user,
+               version() AS postgres_version
+    """,
+    "Database size": """
+        SELECT pg_size_pretty(
+            pg_database_size(current_database())
+        ) AS database_size
+    """,
+    "Top 10 tables": """
+        SELECT schemaname,
+               relname AS table_name,
+               pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+               pg_size_pretty(pg_table_size(relid)) AS table_size,
+               pg_size_pretty(pg_indexes_size(relid)) AS index_size,
+               n_live_tup,
+               n_dead_tup,
+               last_autovacuum
+        FROM pg_stat_user_tables
+        ORDER BY pg_total_relation_size(relid) DESC
+        LIMIT 10
+    """,
+}
+
+with settings.engine.connect() as conn:
+    with conn.begin():
+        conn.execute(text("SET TRANSACTION READ ONLY"))
+        conn.execute(text("SET LOCAL statement_timeout = '30s'"))
+        for title, sql in queries.items():
+            result = conn.execute(text(sql))
+            print("\n" + title)
+            print(" | ".join(result.keys()))
+            for row in result:
+                print(" | ".join(str(value) for value in row))
+```
+
+將腳本保存為 `analyze_db_size.py`，在獲授權的 Airflow environment 中運行：
+
+```bash
+python analyze_db_size.py
+```
+
+若環境已安裝相容的 pandas，可用 `pd.read_sql_query(text(sql), conn)` 將結果讀入 DataFrame。保留同樣的只讀 transaction 設定。診斷主要使用 PostgreSQL 系統統計及容量函數，不需對每張表執行全表 COUNT(*)。
+
+#### 方法 B：psql
+
+```bash
+which psql
+psql --version
+# 參數全部為示例；實際值來自獲授權的配置。
+psql -h db_host -p 5432 -U airflow -d airflow -W
+```
+
+透過密碼提示輸入憑證，不應將密碼放在命令行或 shell history。若原 connection URI 有 SSL 等連接選項，亦需按原配置設定。
+
+| 指令 | 功能 |
+|---|---|
+| `\l` | 列出 database |
+| `\dt` / `\dt+` | 列出 table / 大小 |
+| `\d task_instance` | 查看 table schema |
+| `\di+` | 查看 index |
+| `\conninfo` | 查看當前連接 |
+| `\q` | 離開 |
+
+```sql
+BEGIN READ ONLY;
+SET LOCAL statement_timeout = '30s';
+SELECT current_database();
+SELECT pg_size_pretty(pg_database_size(current_database()));
+ROLLBACK;
+```
+
+亦可在該只讀 transaction 中執行第 3 節的 table size SQL。
+
+#### 方法 C：DBeaver
+
+建立 PostgreSQL connection，使用獲授權的 Host、Port、Database、Username、Password 及 SSL 配置。若工作站受 firewall 或 network segmentation 限制，使用 Airflow 所在環境的 Python 方案，或向 DBA 申請正式存取途徑；不要繞過網絡安全控制。生產診斷優先使用獨立 read-only DB role（若可申請）。
+
+#### 後續腳本目錄（建議，尚未實作）
+
+```text
+airflow/db-housekeeping/
+├── README.md
+├── scripts/
+│   ├── check_connection.py
+│   ├── analyze_db_size.py
+│   ├── analyze_table_history.py
+│   ├── check_dependencies.py
+│   └── cleanup.py
+├── sql/
+│   ├── table_size.sql
+│   ├── table_dependencies.sql
+│   └── retention_analysis.sql
+└── config/
+    └── retention.yaml
+```
+
+下一步：先執行方法 A，取得 PostgreSQL 版本、DB size、最大 10 張表的容量及 autovacuum 情況，再決定 housekeeping 方案。連接成功不代表具有清理、備份或 DDL 權限，相關操作需另外確認。
+
 ## 4. 方案 B：隔離環境 POC
 
 流程：Production 2.2.4 → 完整備份 → Staging restore → 2.3.4 schema upgrade → dry run → cleanup → dump/restore → 目標版本 schema migration → 驗證及切換。
